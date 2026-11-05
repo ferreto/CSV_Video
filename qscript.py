@@ -125,6 +125,38 @@ def _smooth_move(page, from_xy, to_xy, duration_ms=700, steps=30):
     return (x2, y2)
 
 
+# Candidates for the search submit button, most specific first.
+SEARCH_BUTTON_SELECTORS = (
+    'button[type="submit"][aria-label="Search"]',
+    'button[aria-label="Search"]',
+    'form button[type="submit"]',
+    'form input[type="submit"]',
+)
+
+
+def _find_visible(page, selectors, timeout_ms=8000):
+    """Return the first *visible* element matching any of `selectors`, or
+    None if nothing visible shows up within `timeout_ms`.
+
+    Every match of every selector is checked (not just `.first`), because a
+    hidden element that comes earlier in the DOM would otherwise hide the
+    real, visible button.
+    """
+    waited = 0
+    while True:
+        for sel in selectors:
+            try:
+                for loc in page.locator(sel).all():
+                    if loc.is_visible() and loc.bounding_box():
+                        return loc
+            except Exception:
+                pass
+        if waited >= timeout_ms:
+            return None
+        page.wait_for_timeout(250)
+        waited += 250
+
+
 def _human_type(page, text, min_delay=40, max_delay=130):
     """Type text character-by-character with randomized, human-like delays."""
     for ch in text:
@@ -132,15 +164,31 @@ def _human_type(page, text, min_delay=40, max_delay=130):
         page.wait_for_timeout(random.randint(min_delay, max_delay))
 
 
+# DuckDuckGo's own bot-check UI.
+CAPTCHA_SELECTORS = (
+    "form[action*='anomaly']",
+    "input[name='challenge']",
+    "div[id*='anomaly']",
+    "div[class*='captcha']",
+    "[data-testid='anomaly-modal']",
+)
+# Wording of DuckDuckGo's own challenge page. Generic words such as
+# "captcha", "anomaly" or "unusual traffic" are deliberately NOT used: they
+# can appear in the text of ordinary search results (e.g. snippets of pages
+# about CAPTCHAs) and would make a healthy results page look blocked.
+CAPTCHA_TEXT_MARKERS = (
+    "bots use duckduckgo too",
+    "confirm this search was made by a human",
+)
+
+
 def _is_captcha_shown(page):
-    """Return True if DuckDuckGo is showing a CAPTCHA / bot-block page."""
-    for sel in (
-        "form[action*='anomaly']",
-        "input[name='challenge']",
-        "div[id*='anomaly']",
-        "div[class*='captcha']",
-        "[data-testid='anomaly-modal']",
-    ):
+    """Return True if DuckDuckGo is showing a CAPTCHA / bot-block page.
+
+    Callers must check for real search results first: a page that already
+    shows results is never a CAPTCHA page, whatever its text says.
+    """
+    for sel in CAPTCHA_SELECTORS:
         try:
             if page.locator(sel).first.count() > 0:
                 return True
@@ -150,14 +198,34 @@ def _is_captcha_shown(page):
         text = page.locator("body").inner_text(timeout=2000).lower()
     except Exception:
         return False
-    markers = (
-        "bots use duckduckgo too",
-        "human verification",
-        "unusual traffic",
-        "anomaly",
-        "captcha",
-    )
-    return any(m in text for m in markers)
+    return any(m in text for m in CAPTCHA_TEXT_MARKERS)
+
+
+def _restore_cursor(page, pos):
+    """Redraw the injected cursor at `pos`.
+
+    A page navigation replaces the document, so the injected cursor is lost
+    (or sits at its off-screen start position) until the next real mouse
+    move. Playwright's real mouse, however, stays where it was, so redrawing
+    the cursor at the last known position makes it continue from there
+    instead of jumping somewhere else.
+    """
+    try:
+        page.evaluate(
+            "([x, y]) => { if (window.__pw_cursor_move) "
+            "window.__pw_cursor_move(x, y); }",
+            [pos[0], pos[1]],
+        )
+    except Exception:
+        pass  # e.g. the document is being replaced right now
+
+
+def _discard_video(video_obj):
+    """Delete the recording of a failed run so no junk file is left behind."""
+    try:
+        video_obj.delete()
+    except Exception as e:
+        print(f"[qscript] could not delete the failed recording: {e}")
 
 
 def ShowCallout(text, bgColor="yellow", textColor="black", fade=2000):
@@ -180,6 +248,117 @@ def ShowCallout(text, bgColor="yellow", textColor="black", fade=2000):
 
 
 # ---------------------------------------------------------------------------
+# Scenario
+# ---------------------------------------------------------------------------
+def _run_scenario(page, url, city):
+    """Search for Magento developers in `city` and open the first result.
+
+    Raises on any failure; the caller takes care of the recording.
+    """
+    # --- 1. Open page -------------------------------------------------
+    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_timeout(500)
+
+    if _is_captcha_shown(page):
+        raise RuntimeError(
+            "DuckDuckGo showed a CAPTCHA right away - try a different "
+            "IP/VPN or wait until the block expires."
+        )
+
+    # --- 2. Place cursor on screen and show a callout ----------------
+    pos = (640, 360)
+    page.mouse.move(*pos)
+    page.wait_for_timeout(200)
+
+    ShowCallout(f"Searching Magento developers in {city}", fade=1500)
+    page.wait_for_timeout(400)
+
+    # --- 3. Move to the search box -----------------------------------
+    search_box = page.locator('textarea[name="q"]').first
+    search_box.wait_for(state="visible", timeout=15000)
+    bb = search_box.bounding_box()
+    target = (bb["x"] + bb["width"] / 2, bb["y"] + bb["height"] / 2)
+    pos = _smooth_move(page, pos, target, duration_ms=800, steps=40)
+    page.wait_for_timeout(200)
+
+    # --- 4. Click and type the query ---------------------------------
+    page.mouse.click(*pos)
+    page.wait_for_timeout(300)
+
+    _human_type(page, f"Magento developer in {city}")
+    page.wait_for_timeout(400)
+
+    # --- 5. Move to the Search button and click it -------------------
+    # The search is always submitted with a visible mouse click.
+    # The Enter key is deliberately NOT used as a fallback: it is
+    # invisible in the video, so a missing button is an error.
+    submit = _find_visible(page, SEARCH_BUTTON_SELECTORS)
+    sb = submit.bounding_box() if submit is not None else None
+    if not sb:
+        raise RuntimeError("Search button not found")
+    target = (sb["x"] + sb["width"] / 2, sb["y"] + sb["height"] / 2)
+    pos = _smooth_move(page, pos, target, duration_ms=700, steps=30)
+    page.wait_for_timeout(300)  # let the viewer see the cursor on it
+    page.mouse.click(*pos)
+
+    # --- 6. Wait for the results page --------------------------------
+    selectors = [
+        'a[data-testid="result-title-a"]',
+        "#links .result__a",
+        "a.result__a",
+    ]
+    first_result = None
+    for attempt in range(120):  # poll every 250 ms, up to ~30 seconds
+        # The click navigates to a new document, which wipes the injected
+        # cursor. Redraw it where the real mouse still is, so it stays
+        # visible and does not jump while the results load.
+        _restore_cursor(page, pos)
+
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() > 0 and loc.bounding_box():
+                    first_result = loc
+                    break
+            except Exception:
+                pass
+        if first_result is not None:
+            break
+
+        # Only look for a CAPTCHA while there are no results yet (and only
+        # every ~1 s, because reading the whole page text is not free).
+        if attempt % 4 == 3 and _is_captcha_shown(page):
+            try:
+                page.screenshot(path="debug_captcha.png")
+                print("[qscript] CAPTCHA screenshot: debug_captcha.png")
+            except Exception:
+                pass
+            raise RuntimeError(
+                "DuckDuckGo showed a CAPTCHA after the search was "
+                "submitted. Switch IP/VPN or try again later."
+            )
+        page.wait_for_timeout(250)
+
+    if first_result is None:
+        try:
+            page.screenshot(path="debug_no_results.png")
+            print("[qscript] No-results screenshot: debug_no_results.png")
+        except Exception:
+            pass
+        raise RuntimeError("No search results appeared")
+
+    # --- 7. Move to first result and click ---------------------------
+    # The cursor continues from where the Search button was clicked.
+    page.wait_for_timeout(300)
+    rb = first_result.bounding_box()
+    target = (rb["x"] + rb["width"] / 2, rb["y"] + rb["height"] / 2)
+    pos = _smooth_move(page, pos, target, duration_ms=700, steps=30)
+    page.wait_for_timeout(300)
+    page.mouse.click(*pos)
+    page.wait_for_timeout(1500)
+
+
+# ---------------------------------------------------------------------------
 # Main public API
 # ---------------------------------------------------------------------------
 def CaptureVideo_Magento(
@@ -195,6 +374,7 @@ def CaptureVideo_Magento(
     """Run the sample scenario for one CSV row and save its video.
 
     Returns the absolute path to the resulting .webm file, or None on failure.
+    A failed run leaves no video file behind.
     """
     global _ACTIVE_PAGE
 
@@ -210,140 +390,45 @@ def CaptureVideo_Magento(
                 headless=False,
                 args=["--disable-blink-features=AutomationControlled"],
             )
-            context = browser.new_context(
-                record_video_dir=PATH_TO_VIDEO_FOLDER,
-                record_video_size={"width": 1280, "height": 720},
-                viewport={"width": 1280, "height": 720},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-            )
-            context.add_init_script(CURSOR_SCRIPT)
-            page = context.new_page()
-            _ACTIVE_PAGE = page
-
-            # --- 1. Open page ---------------------------------------------
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(500)
-
-            if _is_captcha_shown(page):
-                raise RuntimeError(
-                    "DuckDuckGo сразу показал CAPTCHA — попробуйте другой "
-                    "IP/VPN или дождитесь окончания блокировки."
-                )
-
-            # --- 2. Place cursor on screen and show a callout ------------
-            pos = (640, 360)
-            page.mouse.move(*pos)
-            page.wait_for_timeout(200)
-
-            ShowCallout(
-                f"Searching Magento developers in {city}", fade=1500
-            )
-            page.wait_for_timeout(400)
-
-            # --- 3. Move to the search box -------------------------------
-            search_box = page.locator('textarea[name="q"]').first
-            search_box.wait_for(state="visible", timeout=15000)
-            bb = search_box.bounding_box()
-            target = (bb["x"] + bb["width"] / 2, bb["y"] + bb["height"] / 2)
-            pos = _smooth_move(page, pos, target, duration_ms=800, steps=40)
-            page.wait_for_timeout(200)
-
-            # --- 4. Click and type the query -----------------------------
-            page.mouse.click(*pos)
-            page.wait_for_timeout(300)
-
-            _human_type(page, f"Magento developer in {city}")
-            page.wait_for_timeout(400)
-
-            # --- 5. Move to search button and click ----------------------
+            context = None
+            video_obj = None
+            succeeded = False
             try:
-                submit = page.locator('form button[type="submit"]').first
-                submit.wait_for(state="visible", timeout=5000)
-                sb = submit.bounding_box()
-                target = (
-                    sb["x"] + sb["width"] / 2,
-                    sb["y"] + sb["height"] / 2,
+                # No user_agent override: the real User-Agent of the
+                # installed Chromium always matches its client hints.
+                context = browser.new_context(
+                    record_video_dir=PATH_TO_VIDEO_FOLDER,
+                    record_video_size={"width": 1280, "height": 720},
+                    viewport={"width": 1280, "height": 720},
                 )
-                pos = _smooth_move(page, pos, target, duration_ms=500, steps=25)
-                page.wait_for_timeout(200)
-                page.mouse.click(*pos)
-            except Exception:
-                page.keyboard.press("Enter")
+                context.add_init_script(CURSOR_SCRIPT)
+                page = context.new_page()
+                _ACTIVE_PAGE = page
+                video_obj = page.video
 
-            # --- 6. Wait for the results page ---------------------------
-            selectors = [
-                'a[data-testid="result-title-a"]',
-                "#links .result__a",
-                "a.result__a",
-            ]
-            first_result = None
-            for attempt in range(30):  # poll up to ~30 seconds
-                if _is_captcha_shown(page):
+                _run_scenario(page, url, city)
+                succeeded = True
+            finally:
+                # Always close the context: that is what flushes the
+                # recording to disk. Then keep it (success) or delete it
+                # (failure) so no hash-named junk files pile up.
+                if context is not None:
                     try:
-                        page.screenshot(path="debug_captcha.png")
-                        print("[qscript] CAPTCHA screenshot: debug_captcha.png")
+                        context.close()
                     except Exception:
                         pass
-                    raise RuntimeError(
-                        "DuckDuckGo показал CAPTCHA после отправки поиска. "
-                        "Смените IP/VPN или попробуйте позже."
-                    )
-                for sel in selectors:
-                    try:
-                        loc = page.locator(sel).first
-                        if loc.count() > 0 and loc.bounding_box():
-                            first_result = loc
-                            break
-                    except Exception:
-                        pass
-                if first_result is not None:
-                    break
-                page.wait_for_timeout(1000)
-
-            if first_result is None:
+                if video_obj is not None:
+                    if succeeded:
+                        try:
+                            src = str(video_obj.path())
+                        except Exception as e:
+                            print(f"[qscript] video.path() failed: {e}")
+                    else:
+                        _discard_video(video_obj)
                 try:
-                    page.screenshot(path="debug_no_results.png")
-                    print("[qscript] No-results screenshot: debug_no_results.png")
+                    browser.close()
                 except Exception:
                     pass
-                raise RuntimeError("No search results appeared")
-
-            # After navigation the injected cursor is at (-9999,-9999);
-            # trigger a mousemove to bring it back into view.
-            pos = (640, 360)
-            page.mouse.move(*pos)
-            page.wait_for_timeout(300)
-
-            # --- 7. Move to first result and click ----------------------
-            rb = first_result.bounding_box()
-            target = (rb["x"] + rb["width"] / 2, rb["y"] + rb["height"] / 2)
-            pos = _smooth_move(page, pos, target, duration_ms=700, steps=30)
-            page.wait_for_timeout(300)
-            page.mouse.click(*pos)
-            page.wait_for_timeout(1500)
-
-            # --- 8. Finalize recording ----------------------------------
-            video_obj = page.video
-
-            try:
-                context.close()
-            except Exception:
-                pass
-
-            if video_obj is not None:
-                try:
-                    src = str(video_obj.path())
-                except Exception as e:
-                    print(f"[qscript] video.path() failed: {e}")
-
-            try:
-                browser.close()
-            except Exception:
-                pass
 
     except Exception as e:
         print(f"[qscript] CaptureVideo_Magento failed: {e}")
