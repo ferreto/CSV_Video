@@ -125,6 +125,38 @@ def _smooth_move(page, from_xy, to_xy, duration_ms=700, steps=30):
     return (x2, y2)
 
 
+# Candidates for the search submit button, most specific first.
+SEARCH_BUTTON_SELECTORS = (
+    'button[type="submit"][aria-label="Search"]',
+    'button[aria-label="Search"]',
+    'form button[type="submit"]',
+    'form input[type="submit"]',
+)
+
+
+def _find_visible(page, selectors, timeout_ms=8000):
+    """Return the first *visible* element matching any of `selectors`, or
+    None if nothing visible shows up within `timeout_ms`.
+
+    Every match of every selector is checked (not just `.first`), because a
+    hidden element that comes earlier in the DOM would otherwise hide the
+    real, visible button.
+    """
+    waited = 0
+    while True:
+        for sel in selectors:
+            try:
+                for loc in page.locator(sel).all():
+                    if loc.is_visible() and loc.bounding_box():
+                        return loc
+            except Exception:
+                pass
+        if waited >= timeout_ms:
+            return None
+        page.wait_for_timeout(250)
+        waited += 250
+
+
 def _human_type(page, text, min_delay=40, max_delay=130):
     """Type text character-by-character with randomized, human-like delays."""
     for ch in text:
@@ -230,8 +262,8 @@ def CaptureVideo_Magento(
 
             if _is_captcha_shown(page):
                 raise RuntimeError(
-                    "DuckDuckGo сразу показал CAPTCHA — попробуйте другой "
-                    "IP/VPN или дождитесь окончания блокировки."
+                    "DuckDuckGo showed a CAPTCHA right away - try a different "
+                    "IP/VPN or wait until the block expires."
                 )
 
             # --- 2. Place cursor on screen and show a callout ------------
@@ -259,20 +291,18 @@ def CaptureVideo_Magento(
             _human_type(page, f"Magento developer in {city}")
             page.wait_for_timeout(400)
 
-            # --- 5. Move to search button and click ----------------------
-            try:
-                submit = page.locator('form button[type="submit"]').first
-                submit.wait_for(state="visible", timeout=5000)
-                sb = submit.bounding_box()
-                target = (
-                    sb["x"] + sb["width"] / 2,
-                    sb["y"] + sb["height"] / 2,
-                )
-                pos = _smooth_move(page, pos, target, duration_ms=500, steps=25)
-                page.wait_for_timeout(200)
-                page.mouse.click(*pos)
-            except Exception:
-                page.keyboard.press("Enter")
+            # --- 5. Move to the Search button and click it ---------------
+            # The search is always submitted with a visible mouse click.
+            # The Enter key is deliberately NOT used as a fallback: it is
+            # invisible in the video, so a missing button is an error.
+            submit = _find_visible(page, SEARCH_BUTTON_SELECTORS)
+            sb = submit.bounding_box() if submit is not None else None
+            if not sb:
+                raise RuntimeError("Search button not found")
+            target = (sb["x"] + sb["width"] / 2, sb["y"] + sb["height"] / 2)
+            pos = _smooth_move(page, pos, target, duration_ms=700, steps=30)
+            page.wait_for_timeout(300)  # let the viewer see the cursor on it
+            page.mouse.click(*pos)
 
             # --- 6. Wait for the results page ---------------------------
             selectors = [
@@ -289,8 +319,8 @@ def CaptureVideo_Magento(
                     except Exception:
                         pass
                     raise RuntimeError(
-                        "DuckDuckGo показал CAPTCHA после отправки поиска. "
-                        "Смените IP/VPN или попробуйте позже."
+                        "DuckDuckGo showed a CAPTCHA after the search was "
+                        "submitted. Switch IP/VPN or try again later."
                     )
                 for sel in selectors:
                     try:

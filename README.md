@@ -19,6 +19,8 @@ everything to a `.webm` file per CSV row.
 - Yellow semi-transparent highlight circle that follows the pointer.
 - Smooth, eased cursor movement (`smoothstep`) — no teleporting.
 - Character-by-character human-like typing with randomized delays.
+- The search is submitted by moving the cursor to the Search button and
+  clicking it with the mouse (the Enter key is never used).
 - Expanding click ripple on every click.
 - Auto-sized callout box (yellow background, black text) with fade-in/out.
 
@@ -71,7 +73,7 @@ text
 ├── qscript.py             # CaptureVideo_Magento() + ShowCallout() + cursor script
 ├── requirements.txt       # playwright>=1.40.0
 ├── input.csv              # sample input
-└── video/                 # recorded videos (created automatically, gitignored)
+└── video/                 # recorded videos (created automatically, committed to the repo)
 
 How it works
 
